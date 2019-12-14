@@ -1,56 +1,90 @@
-use std::borrow::Cow;
 use memcache::{Client, Connectable, MemcacheError};
-use std::time::Duration;
+use std::{
+    borrow::Cow,
+    time::{Duration, Instant},
+};
 
 const MEMCACHE_DEFAULT_URL: &'static str = "memcache://localhost:11211";
 
 pub struct GhettoLock<'a> {
     retries: usize,
-    name: Cow<'a, String>,
+    name: Cow<'a, str>,
     /// Memcache client instance.
     memcache: Client,
     /// Expiry in seconds.
     expiry: u32,
     /// The value set in the key to identify the current owner of the key.
-    owner: String,
+    owner: Cow<'a, str>,
 }
 
 // TODO:
+// * add logging
 // * auto-renewal option
 // * check cluster support
 // * failure cases
 // * tests
-// * implement drop for guard to unlock the key
 // * what should be clone, send semantics?
 // * should ghetto_lock have internal mutability?
+// * when unlocking, check if we are the owner
 
-pub struct Guard;
+/// Lock guard returned after successfully acquiring a lock. The lock is automatically unlocked
+/// when the `Guard` is dropped.
+pub struct Guard<'a, 'b> {
+    unlocked: bool,
+    lock: &'a mut GhettoLock<'b>,
+}
 
-pub type LockResult = Result<Guard, Error>;
+impl<'a, 'b> Guard<'a, 'b> {
+    pub fn unlock(&mut self) -> Result<bool, Error> {
+        if !self.unlocked {
+            self.unlocked = true;
+            return self.lock.unlock()
+        }
+        Err(Error::AlreadyUnlocked)
+    }
+}
+
+impl<'a, 'b> Drop for Guard<'a, 'b> {
+    fn drop(&mut self) {
+        if !self.unlocked {
+            let _ = self.lock.unlock();
+        }
+    }
+}
+
+pub type LockResult<'a, 'b> = Result<Guard<'a, 'b>, Error>;
 
 impl<'a> GhettoLock<'a> {
-    pub fn try_lock(&mut self) -> LockResult {
+    pub fn try_lock<'b>(&'b mut self) -> LockResult<'a, 'b> {
         for _ in 0..self.retries {
+            let instant = Instant::now();
             match self.memcache.add(&self.name, &*self.owner, self.expiry) {
                 Ok(()) => {
-                    // TODO: check time validity
-                    // (current time - time before the above call < expiry time)
-                    return Ok(Guard);
+                    // if lock expired before the call could return, we don't have the lock, so
+                    // retry.
+                    if instant.elapsed().as_secs() >= u64::from(self.expiry) {
+                        continue;
+                    }
+                    return Ok(Guard { unlocked: false, lock: self });
                 }
                 _ => {
                     // TODO: handle memcache errors
-                    // TODO: add sleep( nearly equal to expiry time) before retrying 
+                    // TODO: maybe add sleep before retrying
                 }
             }
         }
         Err(Error::RetriesExceeded)
     }
-}
 
+    fn unlock(&mut self) -> Result<bool, Error> {
+        self.memcache.delete(&self.name).map_err(Into::into)
+    }
+}
 
 pub enum Error {
     Memcache(MemcacheError),
-    RetriesExceeded
+    RetriesExceeded,
+    AlreadyUnlocked
 }
 
 impl From<MemcacheError> for Error {
@@ -60,17 +94,17 @@ impl From<MemcacheError> for Error {
 }
 
 pub struct LockOptions<'a, C> {
-    name: Cow<'a, String>,
+    name: Cow<'a, str>,
     connectable: C,
     expiry: Option<u32>,
-    owner: String,
+    owner: Cow<'a, str>,
     read_timeout: Option<Duration>,
     write_timeout: Option<Duration>,
     retries: usize,
 }
 
 impl<'a> LockOptions<'a, &str> {
-    pub fn new(name: Cow<'a, String>, owner: String) -> Self {
+    pub fn new(name: Cow<'a, str>, owner: Cow<'a, str>) -> Self {
         Self {
             name,
             connectable: MEMCACHE_DEFAULT_URL,
@@ -97,7 +131,7 @@ impl<'a, C: Connectable> LockOptions<'a, C> {
             owner: self.owner,
             read_timeout: self.read_timeout,
             write_timeout: self.write_timeout,
-            retries: self.retries
+            retries: self.retries,
         }
     }
 
