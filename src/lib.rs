@@ -1,3 +1,49 @@
+//! This library implements the ghetto lock described
+//! [here](https://github.com/memcached/memcached/wiki/ProgrammingTricks#ghetto-central-locking).
+//! The lock isn't resistant to server failures and should be used only in situations where
+//! strong locking guarantees are not required.
+//!
+//! A popular use case for this library is to avoid the [stampeding herd
+//! problem](https://en.wikipedia.org/wiki/Thundering_herd_problem) caused by a cache
+//! miss.
+//!
+//! # Example:
+//!
+//! ```rust
+//! use ghetto_lock::{LockOptions, LockError};
+//! use memcache::Client;
+//! use std::borrow::Cow;
+//!
+//! fn expensive_computation() -> u64 {
+//!     2 * 2
+//! }
+//!
+//! fn main() {
+//!     let mut client = Client::connect("memcache://localhost:11211").expect("error creating client");
+//!     let mut lock = LockOptions::new(Cow::Borrowed("db-lock"), Cow::Borrowed("owner-1"))
+//!                     .with_expiry(1)
+//!                     .build()
+//!                     .expect("failed to build client");
+//!     let value = client.get("key").expect("failed to get key");
+//!     let v = if value.is_none() {
+//!         lock.try_acquire()
+//!             .and_then(|_guard| {
+//!                 // compute and update cache for other instances to consume
+//!                 let v = expensive_computation();
+//!                 client.set("key", v, 5).expect("failed to set key");
+//!                 Ok(v)
+//!             })
+//!             .or_else(|_| loop {
+//!                 // poll cache key until it is updated.
+//!                 let v = client.get("key").expect("failed to get key");
+//!                 if v.is_none() {
+//!                     continue;
+//!                 }
+//!                 break Ok::<_, LockError>(v.unwrap());
+//!             }).unwrap()
+//!     } else { value.unwrap() };
+//!     assert_eq!(4, v);
+//!}
 #[macro_use]
 extern crate log;
 use memcache::{Client, Connectable, MemcacheError};
@@ -9,8 +55,11 @@ use std::{
 
 const MEMCACHE_DEFAULT_URL: &'static str = "memcache://localhost:11211";
 
+/// The lock configuration along with the connection to memcache server.
 pub struct GhettoLock<'a> {
+    /// Number of times to retry when before giving up to acquire a lock.
     tries: usize,
+    /// Name of the lock. Also used as the key in memcached.
     name: Cow<'a, str>,
     /// Memcache client instance.
     memcache: Client,
@@ -22,39 +71,42 @@ pub struct GhettoLock<'a> {
 
 // TODO:
 // * auto-renewal option
-// * write docs: assumptions, failure cases, limitations
 // * tests
-// * what should be clone, send semantics?
-// * should ghetto_lock have internal mutability?
 
-/// Lock guard returned after successfully acquiring a lock. The lock is automatically unlocked
-/// when the `Guard` is dropped.
+/// Lock guard returned after successfully acquiring a lock.
+/// The lock is automatically released when the `Guard` is dropped.
 pub struct Guard<'a, 'b> {
-    unlocked: bool,
+    released: bool,
     lock: &'a mut GhettoLock<'b>,
 }
 
 impl<'a, 'b> Guard<'a, 'b> {
-    pub unsafe fn unlock(&mut self) -> Result<bool, LockError> {
-        if !self.unlocked {
-            let result = self.lock.unlock().map_err(Into::into);
+    /// Releases the lock by deleting the key in memcache. This function is *NOT* safe
+    /// as of now because the operations used are not atomic. The CAS command required
+    /// to safely release the lock is not implemented by the memcache library yet.
+    ///
+    /// Returns `Ok(true)` when the lock is successfully released.
+    pub unsafe fn try_release(&mut self) -> Result<bool, LockError> {
+        if !self.released {
+            let result = self.lock.release().map_err(Into::into);
             if result.is_ok() {
-                self.unlocked = true;
+                self.released = true;
             }
             return result;
         }
-        Err(LockError::AlreadyUnlocked)
+        Err(LockError::AlreadyReleased)
     }
 }
 
 impl<'a, 'b> Drop for Guard<'a, 'b> {
     fn drop(&mut self) {
-        if !self.unlocked {
-            let _ = unsafe { self.lock.unlock() };
+        if !self.released {
+            let _ = unsafe { self.lock.release() };
         }
     }
 }
 
+/// Result type used by the `try_acquire` function.
 pub type LockResult<'a, 'b> = Result<Guard<'a, 'b>, LockError>;
 
 impl<'a> GhettoLock<'a> {
@@ -76,7 +128,7 @@ impl<'a> GhettoLock<'a> {
                     }
                     debug!(target: "ghetto-lock", "acquired lock: {}, try: {}", &self.name, i);
                     return Ok(Guard {
-                        unlocked: false,
+                        released: false,
                         lock: self,
                     });
                 }
@@ -84,9 +136,9 @@ impl<'a> GhettoLock<'a> {
                     // key already exists in server, so retry
                     MemcacheError::ServerError(0x02) => {
                         debug!(target: "ghetto-lock", "failed to acquire lock: {}, try: {}, already taken", &self.name, i);
+                        // TODO: may be add a configurable sleep here
                         continue;
                     }
-                    // TODO: may be add a configurable sleep here
                     // fail early on unrecoverable errors
                     e => return Err(LockError::MemcacheError(e)),
                 },
@@ -95,32 +147,39 @@ impl<'a> GhettoLock<'a> {
         Err(LockError::TriesExceeded)
     }
 
-    /// Unlocks the lock by deleting the key in memcache. This is NOT safe as of now
+    /// Releases the lock by deleting the key in memcache. This is NOT safe as of now
     /// because cas command is not supported by rust-memcache. Safe only if expiry time
     /// has not exceeded.
-    unsafe fn unlock(&mut self) -> Result<bool, LockError> {
+    unsafe fn release(&mut self) -> Result<bool, LockError> {
         // TODO: Use a gets(&self.name) + cas(&self.name, "", 1576412321, cas_id)
         // when its supported by rust-memcache because get + delete is not atomic
         let result: HashMap<String, String> = self.memcache.gets(vec![&self.name])?;
         if let Some(current_owner) = result.get(&*self.name) {
             if current_owner == &*self.owner {
-                debug!(target: "ghetto-lock", "trying to unlock: {}", &self.name);
+                debug!(target: "ghetto-lock", "trying to release: {}", &self.name);
                 self.memcache.delete(&self.name).map_err(Into::into)
             } else {
-                debug!(target: "ghetto-lock", "trying to unlock: {}, not owned", &self.name);
+                debug!(target: "ghetto-lock", "trying to release: {}, not owned", &self.name);
                 Err(LockError::NotOwned)
             }
         } else {
-            debug!(target: "ghetto-lock", "trying to unlock: {}, already unlocked", &self.name);
-            Err(LockError::AlreadyUnlocked)
+            debug!(target: "ghetto-lock", "trying to release: {}, already released", &self.name);
+            Err(LockError::AlreadyReleased)
         }
     }
 }
 
+/// Error type
+#[derive(Debug)]
 pub enum LockError {
+    /// Acquiring lock failed even after the number of configured retries.
     TriesExceeded,
-    AlreadyUnlocked,
+    /// When trying to release a lock, it was found to be already released.
+    /// This could be because the key has expired.
+    AlreadyReleased,
+    /// Tried to release the lock but it wasn't owned by the current instance.
     NotOwned,
+    /// Other errors returned by the underlying memcache client.
     MemcacheError(MemcacheError),
 }
 
@@ -130,7 +189,7 @@ impl From<MemcacheError> for LockError {
     }
 }
 
-/// Builder for GhettoLock
+/// Builder for `GhettoLock`
 pub struct LockOptions<'a, C> {
     /// Name of the lock. Also used as the memcache key
     name: Cow<'a, str>,
@@ -168,10 +227,10 @@ impl<'a> LockOptions<'a, &str> {
 
 impl<'a, C: Connectable> LockOptions<'a, C> {
     /// Set the expiry in seconds for the the lock key. The lock will be
-    /// automatically unlocked after this number of seconds elapse.
-    /// Defaults to 10 seconds.
+    /// released after this number of seconds elapse.
+    /// Defaults to `10` seconds.
     ///
-    /// Note: A value of 0 denotes no expiry. If a user holding the lock panics, it could lead to
+    /// Note: A value of `0` denotes no expiry. If a user holding the lock panics, it could lead to
     /// a deadlock when there is no expiry.
     pub fn with_expiry(mut self, expiry: u32) -> Self {
         self.expiry = Some(expiry);
