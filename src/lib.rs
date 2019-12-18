@@ -98,9 +98,11 @@ impl<'a, 'b> Guard<'a, 'b> {
     /// to safely release the lock is not implemented by the memcache library yet.
     ///
     /// Returns `Ok(true)` when the lock is successfully released.
-    pub unsafe fn try_release(self) -> Result<bool, LockError> {
+    pub unsafe fn try_release(mut self) -> Result<bool, LockError> {
         if !self.released {
-            self.lock.release().map_err(Into::into)
+            let result = self.lock.release().map_err(Into::into);
+            self.released = result.is_ok();
+            result
         } else {
             Err(LockError::AlreadyReleased)
         }
