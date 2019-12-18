@@ -1,2 +1,2 @@
-# redis-lock-rs
-Implements different redis locks in Rust
+# ghetto-lock-rs
+Implement ghetto-lock
