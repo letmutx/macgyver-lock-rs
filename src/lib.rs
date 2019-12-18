@@ -3,7 +3,7 @@
 //! The lock isn't resistant to server failures and should be used only in situations where
 //! strong locking guarantees are not required.
 //!
-//! A popular use case for this library is to avoid the [stampeding herd
+//! A popular use case for this lock is to avoid the [stampeding herd
 //! problem](https://en.wikipedia.org/wiki/Thundering_herd_problem) caused by a cache
 //! miss.
 //!
@@ -44,21 +44,21 @@
 //!     } else { value.unwrap() };
 //!     assert_eq!(4, v);
 //!}
+//!```
 #[macro_use]
 extern crate log;
 use memcache::{Client, Connectable, MemcacheError};
 use std::{
     borrow::Cow,
     collections::HashMap,
-    time::{Duration, Instant},
+    fmt,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const MEMCACHE_DEFAULT_URL: &'static str = "memcache://localhost:11211";
 
 /// The lock configuration along with the connection to memcache server.
 pub struct GhettoLock<'a> {
-    /// Number of times to retry when before giving up to acquire a lock.
-    tries: usize,
     /// Name of the lock. Also used as the key in memcached.
     name: Cow<'a, str>,
     /// Memcache client instance.
@@ -69,15 +69,27 @@ pub struct GhettoLock<'a> {
     owner: Cow<'a, str>,
 }
 
-// TODO:
-// * auto-renewal option
-// * tests
-
 /// Lock guard returned after successfully acquiring a lock.
 /// The lock is automatically released when the `Guard` is dropped.
-pub struct Guard<'a, 'b> {
+///
+/// Note: The `PartialEq` impl only exists to make error handling simple.
+/// `Guard`s should never be compared. It always returns `false`.
+pub struct Guard<'l, 'b> {
     released: bool,
-    lock: &'a mut GhettoLock<'b>,
+    lock: &'l mut GhettoLock<'b>,
+}
+
+impl<'l, 'b> PartialEq for Guard<'l, 'b> {
+    // There can never be two mutable references to GhettoLock.
+    fn eq(&self, _: &Self) -> bool {
+        false
+    }
+}
+
+impl<'l, 'b> fmt::Debug for Guard<'l, 'b> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Guard {{ released: {} }}", self.released)
+    }
 }
 
 impl<'a, 'b> Guard<'a, 'b> {
@@ -86,15 +98,12 @@ impl<'a, 'b> Guard<'a, 'b> {
     /// to safely release the lock is not implemented by the memcache library yet.
     ///
     /// Returns `Ok(true)` when the lock is successfully released.
-    pub unsafe fn try_release(&mut self) -> Result<bool, LockError> {
+    pub unsafe fn try_release(self) -> Result<bool, LockError> {
         if !self.released {
-            let result = self.lock.release().map_err(Into::into);
-            if result.is_ok() {
-                self.released = true;
-            }
-            return result;
+            self.lock.release().map_err(Into::into)
+        } else {
+            Err(LockError::AlreadyReleased)
         }
-        Err(LockError::AlreadyReleased)
     }
 }
 
@@ -110,41 +119,52 @@ impl<'a, 'b> Drop for Guard<'a, 'b> {
 pub type LockResult<'a, 'b> = Result<Guard<'a, 'b>, LockError>;
 
 impl<'a> GhettoLock<'a> {
-    pub fn try_acquire<'b>(&'b mut self) -> LockResult<'a, 'b> {
-        for i in 0..self.tries {
-            debug!(target: "ghetto-lock", "trying to acquire lock: {}, try: {}", &self.name, i);
-            let instant = Instant::now();
-            match self.memcache.add(&self.name, &*self.owner, self.expiry) {
-                Ok(()) => {
-                    // if lock expired before the call could return, we don't have the lock, so
-                    // retry.
-                    if instant.elapsed().as_secs() >= u64::from(self.expiry) {
-                        debug!(
-                            target: "ghetto-lock",
-                            "failed to acquire lock: {}, try: {}, memcache.add latency: {}",
-                            &self.name, i, instant.elapsed().as_secs()
-                        );
-                        continue;
-                    }
-                    debug!(target: "ghetto-lock", "acquired lock: {}, try: {}", &self.name, i);
-                    return Ok(Guard {
+    fn is_expired(&self, lock_time: Instant) -> bool {
+        self.expiry != 0 // denotes no expiry
+            && if self.expiry <= 60 * 60 * 24 * 30 { // memcache interprets these values as seconds
+                lock_time.elapsed().as_secs() >= u64::from(self.expiry)
+            } else {
+                // check unix time.
+                UNIX_EPOCH + Duration::from_secs(u64::from(self.expiry)) <= SystemTime::now()
+            }
+    }
+
+    // 'l is the scope for which the lock should live.
+    /// Try to acquire the lock, returning the guard if the lock was successfully acquired.
+    /// Otherwise
+    pub fn try_acquire<'l>(&'l mut self) -> LockResult<'l, 'a> {
+        debug!(target: "ghetto-lock", "trying to acquire lock: {}", &self.name);
+        let instant = Instant::now();
+        match self.memcache.add(&self.name, &*self.owner, self.expiry) {
+            Ok(()) => {
+                // if lock expired before the call could return, we don't have the lock, so
+                // retry.
+                if self.is_expired(instant) {
+                    debug!(
+                        target: "ghetto-lock",
+                        "failed to acquire lock: {}, memcache.add latency: {}",
+                        &self.name, instant.elapsed().as_secs()
+                    );
+                    Err(LockError::TimedOut)
+                } else {
+                    debug!(target: "ghetto-lock", "acquired lock: {}", &self.name);
+                    Ok(Guard {
                         released: false,
                         lock: self,
-                    });
+                    })
                 }
-                Err(e) => match e {
-                    // key already exists in server, so retry
-                    MemcacheError::ServerError(0x02) => {
-                        debug!(target: "ghetto-lock", "failed to acquire lock: {}, try: {}, already taken", &self.name, i);
-                        // TODO: may be add a configurable sleep here
-                        continue;
-                    }
-                    // fail early on unrecoverable errors
-                    e => return Err(LockError::MemcacheError(e)),
-                },
             }
+            Err(e) => match e {
+                // key already exists in server, so retry
+                MemcacheError::ServerError(0x02) => {
+                    debug!(target: "ghetto-lock", "failed to acquire lock: {}, already taken", &self.name);
+                    // TODO: may be add a configurable sleep here
+                    Err(LockError::FailedToAcquire)
+                }
+                // fail early on unrecoverable errors
+                e => Err(LockError::MemcacheError(e)),
+            },
         }
-        Err(LockError::TriesExceeded)
     }
 
     /// Releases the lock by deleting the key in memcache. This is NOT safe as of now
@@ -172,15 +192,40 @@ impl<'a> GhettoLock<'a> {
 /// Error type
 #[derive(Debug)]
 pub enum LockError {
-    /// Acquiring lock failed even after the number of configured retries.
-    TriesExceeded,
     /// When trying to release a lock, it was found to be already released.
     /// This could be because the key has expired.
     AlreadyReleased,
     /// Tried to release the lock but it wasn't owned by the current instance.
     NotOwned,
+    /// An other user succeeded in acquiring the lock.
+    FailedToAcquire,
+    /// The `add` call was successful, but a possible latency in network/process
+    /// scheduling caused the lock to be released.
+    TimedOut,
     /// Other errors returned by the underlying memcache client.
     MemcacheError(MemcacheError),
+}
+
+impl PartialEq for LockError {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (LockError::AlreadyReleased, LockError::AlreadyReleased) => true,
+            (LockError::NotOwned, LockError::NotOwned) => true,
+            (LockError::FailedToAcquire, LockError::FailedToAcquire) => true,
+            (LockError::TimedOut, LockError::TimedOut) => true,
+            (LockError::MemcacheError(l), LockError::MemcacheError(r)) => match (l, r) {
+                (MemcacheError::Io(l), MemcacheError::Io(r)) => l.kind() == r.kind(),
+                (MemcacheError::ClientError(l), MemcacheError::ClientError(r)) => l == r,
+                (MemcacheError::ServerError(l), MemcacheError::ServerError(r)) => l == r,
+                (MemcacheError::FromUtf8(_), MemcacheError::FromUtf8(_)) => true,
+                (MemcacheError::ParseIntError(_), MemcacheError::ParseIntError(_)) => true,
+                (MemcacheError::ParseFloatError(_), MemcacheError::ParseFloatError(_)) => true,
+                (MemcacheError::ParseBoolError(_), MemcacheError::ParseBoolError(_)) => true,
+                _ => false,
+            },
+            _ => false,
+        }
+    }
 }
 
 impl From<MemcacheError> for LockError {
@@ -203,8 +248,6 @@ pub struct LockOptions<'a, C> {
     read_timeout: Option<Duration>,
     /// Write timeout for the underlying connection.
     write_timeout: Option<Duration>,
-    /// The number of times to try acquiring the lock before giving up.
-    tries: usize,
 }
 
 impl<'a> LockOptions<'a, &str> {
@@ -220,7 +263,6 @@ impl<'a> LockOptions<'a, &str> {
             owner: owner,
             read_timeout: None,
             write_timeout: None,
-            tries: 1,
         }
     }
 }
@@ -230,8 +272,15 @@ impl<'a, C: Connectable> LockOptions<'a, C> {
     /// released after this number of seconds elapse.
     /// Defaults to `10` seconds.
     ///
-    /// Note: A value of `0` denotes no expiry. If a user holding the lock panics, it could lead to
-    /// a deadlock when there is no expiry.
+    /// Note: A value of `0` denotes no expiry and a value greater than 24*60*60*30
+    /// is interpreted as a unix timestamp.
+    ///
+    /// Note 2: `std::time::SystemTime::now` is used to check if the lock has expired
+    /// when expiry is interepreted as UNIX timestamp. The check might fail if the system
+    /// time has been tampered with.
+    ///
+    /// If a user holding the lock panics, it could lead to a deadlock when there is no
+    /// expiry.
     pub fn with_expiry(mut self, expiry: u32) -> Self {
         self.expiry = Some(expiry);
         self
@@ -246,7 +295,6 @@ impl<'a, C: Connectable> LockOptions<'a, C> {
             owner: self.owner,
             read_timeout: self.read_timeout,
             write_timeout: self.write_timeout,
-            tries: self.tries,
         }
     }
 
@@ -266,25 +314,12 @@ impl<'a, C: Connectable> LockOptions<'a, C> {
         self
     }
 
-    /// The number of retry attempts that should be made while trying to acquire the lock before
-    /// giving up.
-    ///
-    /// # Panics
-    ///
-    /// Panics if tries is equal to 0.
-    pub fn with_tries(mut self, tries: usize) -> Self {
-        assert!(tries > 0);
-        self.tries = tries;
-        self
-    }
-
     /// Build the lock.
     pub fn build(self) -> Result<GhettoLock<'a>, LockError> {
         let mut memcache = Client::connect(self.connectable)?;
         memcache.set_read_timeout(self.read_timeout)?;
         memcache.set_write_timeout(self.write_timeout)?;
         Ok(GhettoLock {
-            tries: self.tries,
             name: self.name,
             memcache,
             owner: self.owner,
