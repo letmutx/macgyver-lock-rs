@@ -133,7 +133,7 @@ impl<'a> GhettoLock<'a> {
 
     // 'l is the scope for which the lock should live.
     /// Try to acquire the lock, returning the guard if the lock was successfully acquired.
-    /// Otherwise
+    /// Otherwise returns an error denoting why the lock couldn't be acquired.
     pub fn try_acquire<'l>(&'l mut self) -> LockResult<'l, 'a> {
         debug!(target: "ghetto-lock", "trying to acquire lock: {}", &self.name);
         let instant = Instant::now();
