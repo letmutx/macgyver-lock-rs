@@ -1,6 +1,6 @@
 [package]
 name = "ghetto-lock"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Rohit Kumar <letmutx@gmail.com>"]
 description = "Memcache backed ghetto lock implementation"
 repository = "https://github.com/letmutx/ghetto-lock-rs.git"
