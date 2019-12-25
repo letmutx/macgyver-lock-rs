@@ -47,13 +47,15 @@
 //!```
 #[macro_use]
 extern crate log;
-use memcache::{Client, Connectable, MemcacheError};
+use memcache::{Client, Connectable};
 use std::{
     borrow::Cow,
     collections::HashMap,
     fmt,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+pub use memcache::MemcacheError;
 
 const MEMCACHE_DEFAULT_URL: &'static str = "memcache://localhost:11211";
 
