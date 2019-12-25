@@ -60,3 +60,23 @@ fn test_lock_fails_when_expiry_is_in_the_past() {
         .expect("failed to build client");
     assert_eq!(Err(LockError::TimedOut), lock.try_acquire());
 }
+
+#[test]
+fn test_rust_memcache_bug() {
+    setup();
+    let mut lock = LockOptions::new(Cow::Borrowed("db-lock"), Cow::Borrowed("owner"))
+        .with_expiry(1000)
+        .build()
+        .expect("failed to build client");
+    let mut lock2 = LockOptions::new(Cow::Borrowed("db-lock"), Cow::Borrowed("owner-2"))
+        .with_expiry(1000)
+        .build()
+        .expect("failed to build client");
+    let _guard = lock.try_acquire().expect("can't acquire lock: owner");
+    {
+        let result = lock2.try_acquire();
+        assert_eq!(Err(LockError::FailedToAcquire), result);
+    }
+    let result = lock2.try_acquire();
+    assert_eq!(Err(LockError::FailedToAcquire), result);
+}
