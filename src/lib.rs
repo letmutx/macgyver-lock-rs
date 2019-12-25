@@ -137,21 +137,20 @@ impl<'a> GhettoLock<'a> {
     /// Try to acquire the lock, returning the guard if the lock was successfully acquired.
     /// Otherwise returns an error denoting why the lock couldn't be acquired.
     pub fn try_acquire<'l>(&'l mut self) -> LockResult<'l, 'a> {
-        debug!(target: "ghetto-lock", "trying to acquire lock: {}", &self.name);
+        debug!(target: "ghetto-lock", "trying to acquire lock: {} for user: {}", &self.name, &self.owner);
         let instant = Instant::now();
         match self.memcache.add(&self.name, &*self.owner, self.expiry) {
             Ok(()) => {
-                // if lock expired before the call could return, we don't have the lock, so
-                // retry.
+                // if lock expired before the call could return, we don't have the lock, so error.
                 if self.is_expired(instant) {
                     debug!(
                         target: "ghetto-lock",
-                        "failed to acquire lock: {}, memcache.add latency: {}",
-                        &self.name, instant.elapsed().as_secs()
+                        "failed to acquire lock: {} for user: {}, memcache.add latency: {}",
+                        &self.name, &self.owner, instant.elapsed().as_secs()
                     );
                     Err(LockError::TimedOut)
                 } else {
-                    debug!(target: "ghetto-lock", "acquired lock: {}", &self.name);
+                    debug!(target: "ghetto-lock", "acquired lock: {} for user: {}", &self.name, &self.owner);
                     Ok(Guard {
                         released: false,
                         lock: self,
@@ -165,7 +164,6 @@ impl<'a> GhettoLock<'a> {
                     // TODO: may be add a configurable sleep here
                     Err(LockError::FailedToAcquire)
                 }
-                // fail early on unrecoverable errors
                 e => Err(LockError::MemcacheError(e)),
             },
         }
@@ -291,6 +289,9 @@ impl<'a, C: Connectable> LockOptions<'a, C> {
     }
 
     /// The memcache servers to use.
+    ///
+    /// Note: The Connectable shouldn't use ASCII protocol because the underlying memcache
+    /// library doesn't give a way to detect if acquiring the lock succeeded.
     pub fn with_connectable<K: Connectable>(self, connectable: K) -> LockOptions<'a, K> {
         LockOptions {
             connectable: connectable,
