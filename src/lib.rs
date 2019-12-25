@@ -95,12 +95,10 @@ impl<'l, 'b> fmt::Debug for Guard<'l, 'b> {
 }
 
 impl<'a, 'b> Guard<'a, 'b> {
-    /// Releases the lock by deleting the key in memcache. This function is *NOT* safe
-    /// as of now because the operations used are not atomic. The CAS command required
-    /// to safely release the lock is not implemented by the memcache library yet.
+    /// Releases the lock by deleting the key in memcache.
     ///
-    /// Returns `Ok(true)` when the lock is successfully released.
-    pub unsafe fn try_release(mut self) -> Result<bool, LockError> {
+    /// Returns `Ok(())` when the lock is successfully released.
+    pub fn try_release(mut self) -> Result<(), LockError> {
         if !self.released {
             let result = self.lock.release().map_err(Into::into);
             self.released = result.is_ok();
@@ -114,7 +112,7 @@ impl<'a, 'b> Guard<'a, 'b> {
 impl<'a, 'b> Drop for Guard<'a, 'b> {
     fn drop(&mut self) {
         if !self.released {
-            let _ = unsafe { self.lock.release() };
+            let _ = self.lock.release();
         }
     }
 }
@@ -169,17 +167,25 @@ impl<'a> GhettoLock<'a> {
         }
     }
 
-    /// Releases the lock by deleting the key in memcache. This is NOT safe as of now
-    /// because cas command is not supported by rust-memcache. Safe only if expiry time
-    /// has not exceeded.
-    unsafe fn release(&mut self) -> Result<bool, LockError> {
-        // TODO: Use a gets(&self.name) + cas(&self.name, "", 1576412321, cas_id)
-        // when its supported by rust-memcache because get + delete is not atomic
-        let result: HashMap<String, String> = self.memcache.gets(vec![&self.name])?;
-        if let Some(current_owner) = result.get(&*self.name) {
-            if current_owner == &*self.owner {
+    /// Using CAS with an expiry value in the past to atomically delete the lock as
+    /// `delete` doesn't accept `cas_id`.
+    ///
+    /// Returns `true` if the key has been successfully deleted. `false` if key expired.
+    fn delete(&mut self, cas: u64) -> Result<(), LockError> {
+        match self.memcache.cas(&self.name, "", 1576412321, cas)? {
+            true => Ok(()),
+            false => Err(LockError::AlreadyReleased),
+        }
+    }
+
+    /// Releases the lock by deleting the key in memcache.
+    fn release(&mut self) -> Result<(), LockError> {
+        let result: HashMap<String, (Vec<u8>, u32, Option<u64>)> =
+            self.memcache.gets(vec![&self.name])?;
+        if let Some((current_owner, _, cas)) = result.get(&*self.name) {
+            if *current_owner == &*self.owner.as_bytes() {
                 debug!(target: "ghetto-lock", "trying to release: {}", &self.name);
-                self.memcache.delete(&self.name).map_err(Into::into)
+                self.delete(cas.expect("cas should be present"))
             } else {
                 debug!(target: "ghetto-lock", "trying to release: {}, not owned", &self.name);
                 Err(LockError::NotOwned)
@@ -240,7 +246,7 @@ impl From<MemcacheError> for LockError {
 pub struct LockOptions<'a, C> {
     /// Name of the lock. Also used as the memcache key
     name: Cow<'a, str>,
-    /// Connectable which can resolve to a list of memcache servers.
+    /// `Connectable` which can resolve to a list of memcache servers.
     connectable: C,
     /// Expiry to use for the memcache lock key in seconds.
     expiry: Option<u32>,
@@ -290,7 +296,9 @@ impl<'a, C: Connectable> LockOptions<'a, C> {
 
     /// The memcache servers to use.
     ///
-    /// Note: The Connectable shouldn't use ASCII protocol because the underlying memcache
+    /// Defaults to `memcache://localhost:11211`
+    ///
+    /// Note: The `Connectable` shouldn't use ASCII protocol because the underlying memcache
     /// library doesn't give a way to detect if acquiring the lock succeeded.
     pub fn with_connectable<K: Connectable>(self, connectable: K) -> LockOptions<'a, K> {
         LockOptions {
