@@ -16,9 +16,9 @@ fn test_lock_release() {
         .build()
         .expect("failed to build client");
     let guard = lock.try_acquire().expect("failed to acquire lock");
-    let result = unsafe { guard.try_release() };
+    let result = guard.try_release();
     assert!(result.is_ok(), format!("{:?}", result.err()));
-    assert!(result.unwrap(), true);
+    assert_eq!(result.unwrap(), ());
 }
 
 #[test]
@@ -30,10 +30,7 @@ fn test_long_running_job() {
         .expect("failed to build client");
     let guard = lock.try_acquire().expect("failed to acquire lock");
     sleep(Duration::new(2, 0));
-    assert_eq!(
-        unsafe { guard.try_release() },
-        Err(LockError::AlreadyReleased)
-    );
+    assert_eq!(guard.try_release(), Err(LockError::AlreadyReleased));
 }
 
 #[test]
