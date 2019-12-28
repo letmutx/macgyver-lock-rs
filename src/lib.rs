@@ -159,7 +159,6 @@ impl<'a> GhettoLock<'a> {
                 // key already exists in server, so retry
                 MemcacheError::ServerError(0x02) => {
                     debug!(target: "ghetto-lock", "failed to acquire lock: {}, already taken", &self.name);
-                    // TODO: may be add a configurable sleep here
                     Err(LockError::FailedToAcquire)
                 }
                 e => Err(LockError::MemcacheError(e)),
@@ -181,7 +180,7 @@ impl<'a> GhettoLock<'a> {
     /// Releases the lock by deleting the key in memcache.
     fn release(&mut self) -> Result<(), LockError> {
         let result: HashMap<String, (Vec<u8>, u32, Option<u64>)> =
-            self.memcache.gets(vec![&self.name])?;
+            self.memcache.gets(&[&self.name])?;
         if let Some((current_owner, _, cas)) = result.get(&*self.name) {
             if *current_owner == &*self.owner.as_bytes() {
                 debug!(target: "ghetto-lock", "trying to release: {}", &self.name);
