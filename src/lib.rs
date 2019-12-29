@@ -1,4 +1,4 @@
-//! This library implements the ghetto lock described
+//! This library implements the lock described
 //! [here](https://github.com/memcached/memcached/wiki/ProgrammingTricks#ghetto-central-locking).
 //! The lock isn't resistant to server failures and should be used only in situations where
 //! strong locking guarantees are not required.
@@ -10,7 +10,7 @@
 //! # Example:
 //!
 //! ```rust
-//! use ghetto_lock::{LockOptions, LockError};
+//! use macgyver_lock::{LockOptions, LockError};
 //! use memcache::Client;
 //! use std::borrow::Cow;
 //!
@@ -47,7 +47,7 @@
 //!```
 #[macro_use]
 extern crate log;
-use memcache::{Client, Connectable};
+use memcache::Client;
 use std::{
     borrow::Cow,
     collections::HashMap,
@@ -55,12 +55,12 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-pub use memcache::MemcacheError;
+pub use memcache::{Connectable, MemcacheError};
 
 const MEMCACHE_DEFAULT_URL: &'static str = "memcache://localhost:11211";
 
 /// The lock configuration along with the connection to memcache server.
-pub struct GhettoLock<'a> {
+pub struct MacGyverLock<'a> {
     /// Name of the lock. Also used as the key in memcached.
     name: Cow<'a, str>,
     /// Memcache client instance.
@@ -78,11 +78,11 @@ pub struct GhettoLock<'a> {
 /// `Guard`s should never be compared. It always returns `false`.
 pub struct Guard<'l, 'b> {
     released: bool,
-    lock: &'l mut GhettoLock<'b>,
+    lock: &'l mut MacGyverLock<'b>,
 }
 
 impl<'l, 'b> PartialEq for Guard<'l, 'b> {
-    // There can never be two mutable references to GhettoLock.
+    // There can never be two mutable references to MacGyverLock.
     fn eq(&self, _: &Self) -> bool {
         false
     }
@@ -120,7 +120,7 @@ impl<'a, 'b> Drop for Guard<'a, 'b> {
 /// Result type used by the `try_acquire` function.
 pub type LockResult<'a, 'b> = Result<Guard<'a, 'b>, LockError>;
 
-impl<'a> GhettoLock<'a> {
+impl<'a> MacGyverLock<'a> {
     fn is_expired(&self, lock_time: Instant) -> bool {
         self.expiry != 0 // denotes no expiry
             && if self.expiry <= 60 * 60 * 24 * 30 { // memcache interprets these values as seconds
@@ -135,20 +135,20 @@ impl<'a> GhettoLock<'a> {
     /// Try to acquire the lock, returning the guard if the lock was successfully acquired.
     /// Otherwise returns an error denoting why the lock couldn't be acquired.
     pub fn try_acquire<'l>(&'l mut self) -> LockResult<'l, 'a> {
-        debug!(target: "ghetto-lock", "trying to acquire lock: {} for user: {}", &self.name, &self.owner);
+        debug!(target: "macgyver-lock", "trying to acquire lock: {} for user: {}", &self.name, &self.owner);
         let instant = Instant::now();
         match self.memcache.add(&self.name, &*self.owner, self.expiry) {
             Ok(()) => {
                 // if lock expired before the call could return, we don't have the lock, so error.
                 if self.is_expired(instant) {
                     debug!(
-                        target: "ghetto-lock",
+                        target: "macgyver-lock",
                         "failed to acquire lock: {} for user: {}, memcache.add latency: {}",
                         &self.name, &self.owner, instant.elapsed().as_secs()
                     );
                     Err(LockError::TimedOut)
                 } else {
-                    debug!(target: "ghetto-lock", "acquired lock: {} for user: {}", &self.name, &self.owner);
+                    debug!(target: "macgyver-lock", "acquired lock: {} for user: {}", &self.name, &self.owner);
                     Ok(Guard {
                         released: false,
                         lock: self,
@@ -158,7 +158,7 @@ impl<'a> GhettoLock<'a> {
             Err(e) => match e {
                 // key already exists in server, so retry
                 MemcacheError::ServerError(0x02) => {
-                    debug!(target: "ghetto-lock", "failed to acquire lock: {}, already taken", &self.name);
+                    debug!(target: "macgyver-lock", "failed to acquire lock: {}, already taken", &self.name);
                     Err(LockError::FailedToAcquire)
                 }
                 e => Err(LockError::MemcacheError(e)),
@@ -183,14 +183,14 @@ impl<'a> GhettoLock<'a> {
             self.memcache.gets(&[&self.name])?;
         if let Some((current_owner, _, cas)) = result.get(&*self.name) {
             if *current_owner == &*self.owner.as_bytes() {
-                debug!(target: "ghetto-lock", "trying to release: {}", &self.name);
+                debug!(target: "macgyver-lock", "trying to release: {}", &self.name);
                 self.delete(cas.expect("cas should be present"))
             } else {
-                debug!(target: "ghetto-lock", "trying to release: {}, not owned", &self.name);
+                debug!(target: "macgyver-lock", "trying to release: {}, not owned", &self.name);
                 Err(LockError::NotOwned)
             }
         } else {
-            debug!(target: "ghetto-lock", "trying to release: {}, already released", &self.name);
+            debug!(target: "macgyver-lock", "trying to release: {}, already released", &self.name);
             Err(LockError::AlreadyReleased)
         }
     }
@@ -241,7 +241,7 @@ impl From<MemcacheError> for LockError {
     }
 }
 
-/// Builder for `GhettoLock`
+/// Builder for `MacGyverLock`
 pub struct LockOptions<'a, C> {
     /// Name of the lock. Also used as the memcache key
     name: Cow<'a, str>,
@@ -327,11 +327,11 @@ impl<'a, C: Connectable> LockOptions<'a, C> {
     }
 
     /// Build the lock.
-    pub fn build(self) -> Result<GhettoLock<'a>, LockError> {
+    pub fn build(self) -> Result<MacGyverLock<'a>, LockError> {
         let mut memcache = Client::connect(self.connectable)?;
         memcache.set_read_timeout(self.read_timeout)?;
         memcache.set_write_timeout(self.write_timeout)?;
-        Ok(GhettoLock {
+        Ok(MacGyverLock {
             name: self.name,
             memcache,
             owner: self.owner,

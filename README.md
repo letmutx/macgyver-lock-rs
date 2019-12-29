@@ -1,4 +1,4 @@
-# ghetto-lock
+# macgyver-lock
 
 [![Build Status](https://api.travis-ci.org/letmutx/ghetto-lock-rs.svg?branch=master)](https://travis-ci.org/letmutx/ghetto-lock-rs.svg?branch=master)
 
@@ -9,13 +9,13 @@ This library implements the ghetto lock described [here](https://github.com/memc
  ## Usage:
  Add to your `Cargo.toml`:
  ```
-ghetto-lock = "0.2.0"
+macgyver-lock = "0.1.0"
 ```
 
  ## Example:
 
  ```rust
- use ghetto_lock::{LockOptions, LockError};
+ use macgyver_lock::{LockOptions, LockError};
  use memcache::Client;
  use std::borrow::Cow;
 

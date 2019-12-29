@@ -1,6 +1,6 @@
 use std::{borrow::Cow, thread::sleep, time::Duration};
 
-use ghetto_lock::{LockError, LockOptions};
+use macgyver_lock::{LockError, LockOptions};
 use memcache::Client;
 
 fn setup() {
