@@ -9,7 +9,7 @@ This library implements the ghetto lock described [here](https://github.com/memc
  ## Usage:
  Add to your `Cargo.toml`:
  ```
-macgyver-lock = "0.1.0"
+macgyver-lock = "0.2.0"
 ```
 
  ## Example:
