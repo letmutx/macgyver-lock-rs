@@ -1,6 +1,6 @@
 # macgyver-lock
 
-[![Build Status](https://api.travis-ci.org/letmutx/ghetto-lock-rs.svg?branch=master)](https://travis-ci.org/letmutx/ghetto-lock-rs.svg?branch=master)
+[![Build Status](https://api.travis-ci.org/letmutx/macgyver-lock-rs.svg?branch=master)](https://travis-ci.org/letmutx/macgyver-lock-rs.svg?branch=master)
 
 This library implements the ghetto lock described [here](https://github.com/memcached/memcached/wiki/ProgrammingTricks#ghetto-central-locking). The lock isn't resistant to server failures and should be used only in situations where strong locking guarantees are not required.
 
