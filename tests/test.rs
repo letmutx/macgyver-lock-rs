@@ -15,7 +15,7 @@ fn test_lock_release() {
         .with_expiry(1)
         .build()
         .expect("failed to build client");
-    let guard = lock.try_acquire().expect("failed to acquire lock");
+    let mut guard = lock.try_acquire().expect("failed to acquire lock");
     let result = guard.try_release();
     assert!(result.is_ok(), format!("{:?}", result.err()));
     assert_eq!(result.unwrap(), ());
@@ -28,7 +28,7 @@ fn test_long_running_job() {
         .with_expiry(1)
         .build()
         .expect("failed to build client");
-    let guard = lock.try_acquire().expect("failed to acquire lock");
+    let mut guard = lock.try_acquire().expect("failed to acquire lock");
     sleep(Duration::new(2, 0));
     assert_eq!(guard.try_release(), Err(LockError::AlreadyReleased));
 }
