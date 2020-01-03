@@ -98,7 +98,7 @@ impl<'a, 'b> Guard<'a, 'b> {
     /// Releases the lock by deleting the key in memcache.
     ///
     /// Returns `Ok(())` when the lock is successfully released.
-    pub fn try_release(mut self) -> Result<(), LockError> {
+    pub fn try_release(&mut self) -> Result<(), LockError> {
         if !self.released {
             let result = self.lock.release().map_err(Into::into);
             self.released = result.is_ok();
